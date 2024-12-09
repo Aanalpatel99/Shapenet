@@ -1,108 +1,90 @@
-import streamlit as st
 import tensorflow as tf
-import numpy as np
+import streamlit as st
 from PIL import Image
-import io
-
-# Load your CNN model (replace 'model_path' with the path to your .keras model file)
-model = tf.keras.models.load_model('/_Projects/Shapenet/app/02691156.keras')
-
-# Function to preprocess image for model prediction
-def preprocess_image(image: Image.Image):
-    # Resize image to (128, 128) and convert to grayscale
-    image = image.convert("L")  # Convert to grayscale
-    image = image.resize((128, 128))  # Resize to match input shape of the model
-    image_array = np.array(image)  # Convert to numpy array
-    image_array = image_array.astype('float32') / 255.0  # Normalize image
-    image_array = np.expand_dims(image_array, axis=-1)  # Add channel dimension (128, 128, 1)
-    image_array = np.expand_dims(image_array, axis=0)  # Add batch dimension (1, 128, 128, 1)
-    return image_array
-
-# Function to save 3D object as OBJ file
-def save_obj_file(output, filename='output.obj'):
-
-    predicted_voxel = output[0, :, :, :, 0]
-
-    # Convert the voxel grid to a binary format (can modify threshold)
-    predicted_voxel_binary = (predicted_voxel > 0.5).astype(np.uint8)
-
-    # Vertices and faces for an individual cube (each voxel)
-    vertex_offsets = [
-        (0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
-        (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)
-    ]
-    
-    face_offsets = [
-        (0, 1, 2, 3), # Bottom
-        (4, 5, 6, 7), # Top
-        (0, 1, 5, 4), # Front
-        (2, 3, 7, 6), # Back
-        (1, 2, 6, 5), # Right
-        (3, 0, 4, 7)  # Left
-    ]
-
-    vertices = []
-    faces = []
-    vertex_index = 1
-
-    # Iterate through the 3D array and process each voxel
-    for x in range(predicted_voxel_binary.shape[0]):
-        for y in range(predicted_voxel_binary.shape[1]):
-            for z in range(predicted_voxel_binary.shape[2]):
-                if predicted_voxel_binary[x, y, z] == 1:  # Only process occupied voxels (value 1)
-                    # Add vertices for this voxel's cube
-                    for dx, dy, dz in vertex_offsets:
-                        vertices.append((x + dx, y + dy, z + dz))
-
-                    # Add faces using the latest 8 vertices
-                    for face in face_offsets:
-                        faces.append((
-                            vertex_index + face[0],
-                            vertex_index + face[1],
-                            vertex_index + face[2],
-                            vertex_index + face[3]
-                        ))
-
-                    # Update the vertex index
-                    vertex_index += 8
-
-    # Write vertices and faces to an OBJ file
-    with open(filename, 'w') as f:
-        for vertex in vertices:
-            f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
-        for face in faces:
-            f.write(f"f {face[0]} {face[1]} {face[2]} {face[3]}\n")
-
-    return filename
+import helpers as h
+import constants as c
+import numpy as np
+import pyvista as pv
 
 # Streamlit UI
-st.title("2D Image to 3D Object Prediction")
-st.write("Upload a PNG or JPG image, and get a 3D OBJ file as output.")
+st.title("2D Image to 3D Voxel Grid Prediction")
+st.write("Upload a PNG or JPG image, and get a 3D object file as an output.")
+
+model_selected = st.selectbox(
+    "Select your model based on your object:",
+    tuple(c.LOW_CAPACITY_LABELS + c.HIGH_CAPACITY_LABELS),
+)
 
 # File upload
 uploaded_file = st.file_uploader("Choose an image file", type=["png", "jpg"])
 
-if uploaded_file is not None:
-    # Read image
-    image = Image.open(uploaded_file)
-    st.image(image, caption='Uploaded Image', use_column_width=True)
+if uploaded_file is not None and model_selected is not None:
+
+    # Retrieve model name from selected option
+    model_name, capacity_label = h.get_model_name(model_selected)
+
+    # Load your CNN model (replace 'model_path' with the path to your .keras model file)
+    model = tf.keras.models.load_model(c.MODELS_BASE_PATH + f"/{capacity_label}/{model_name}.keras")
+
+    # Read uploaded image
+    image_upload = Image.open(uploaded_file)
+    st.image(image_upload, caption='Uploaded Image', use_column_width=True)
+    h.save_npy_array_from_png([uploaded_file], (128, 128), npy_filename="temp/image")
     
     # Preprocess image for the model
-    image_array = preprocess_image(image)
-
+    image_numpy = np.load('temp/image.npy')
+    
     # Model prediction
     with st.spinner("Predicting 3D object..."):
-        predicted_output = model.predict(image_array)
+        y_pred = model.predict(image_numpy)
+        del model
     
     # Save the prediction as OBJ file
-    obj_filename = save_obj_file(predicted_output, 'predicted_output.obj')
-    
+    y_pred = h.post_process_predicted_voxel(y_pred[0, :, :, :, 0])
+    h.save_voxel_grid_to_obj(y_pred, 'temp/predicted_output.obj')
+
+    # Visualize result
+    if st.button("Visualize"):
+        # Create a sample 3D boolean NumPy array (voxel grid)
+        voxel_grid = y_pred
+
+        # Define the grid dimensions and spacing
+        grid = pv.ImageData()
+        grid.dimensions = np.array(voxel_grid.shape) + 1  # Add 1 for proper cell representation
+        grid.spacing = (1, 1, 1)  # Optional: Set the spacing between grid cells
+
+        # Add the boolean array as cell data (voxel representation)
+        grid.cell_data["values"] = voxel_grid.flatten(order="F")  # Flatten in Fortran order
+
+        # Apply a threshold filter to extract only filled voxels
+        thresholded = grid.threshold(0.5)  # Thresholding separates True (filled) from False (empty)
+
+        # Visualize the 3D object
+        plotter = pv.Plotter()
+        plotter.show_axes()
+        actor = plotter.add_mesh(thresholded, color="gray", show_edges=True)
+        actor.rotate_x(90)
+        actor.rotate_y(-45)
+        plotter.show()
+
     # Provide download link
     st.success("Prediction complete! You can download the 3D object below.")
-    with open(obj_filename, "rb") as f:
+    with open('temp/predicted_output.obj', "rb") as f:
         st.download_button(
             label="Download 3D OBJ file",
             data=f,
-            file_name=obj_filename,
+            file_name='predicted_output.obj',
             mime="application/octet-stream"
         )
+
+st.markdown(
+         f"""
+         <style>
+         .stApp {{
+             background: url("{c.IMAGE_URL}");
+             background-size: cover
+         }}
+         </style>
+         """,
+         unsafe_allow_html=True
+     )
